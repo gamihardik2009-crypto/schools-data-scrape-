@@ -1,161 +1,134 @@
+import asyncio
 import pandas as pd
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
 
 from rich.console import Console
 from rich.table import Table
 
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-
-from webdriver_manager.chrome import ChromeDriverManager
-
+from playwright.async_api import async_playwright, TimeoutError
 
 console = Console()
 
-SCRAPED_STAFF_URLS = set()
-url_lock = Lock()
 
-
-def make_driver():
-    options = Options()
-    options.add_argument("--headless=new")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--no-sandbox")
-
-    return webdriver.Chrome(
-        service=Service(ChromeDriverManager().install()),
-        options=options
+# ---------------- Get School List ----------------
+async def get_schools(page):
+    await page.goto(
+        "https://www.fultonschools.org/our-district/schools-admin-locations/all-fcs-schools",
+        timeout=60000
     )
 
-
-def get_schools():
-    driver = make_driver()
-    driver.get("https://www.fultonschools.org/our-district/schools-admin-locations/all-fcs-schools")
-
-    WebDriverWait(driver, 15).until(
-        EC.presence_of_element_located((By.CSS_SELECTOR, "section header h2 a"))
-    )
+    await page.wait_for_selector("section header h2 a")
 
     schools = []
-
-    buttons = driver.find_elements(By.CSS_SELECTOR, "section > div > section header h2 a")
+    buttons = await page.query_selector_all("section > div > section header h2 a")
 
     for btn in buttons:
         try:
-            name = btn.text.strip()
-            panel_id = btn.get_attribute("aria-controls")
-            panel = driver.find_element(By.ID, panel_id)
+            name = (await btn.inner_text()).strip()
+            panel_id = await btn.get_attribute("aria-controls")
 
-            link = panel.find_element(
-                By.XPATH, ".//a[normalize-space()='School Website']"
-            ).get_attribute("href")
+            panel = await page.query_selector(f"#{panel_id}")
+            link = await panel.query_selector("a:text('School Website')")
+            link = await link.get_attribute("href")
 
             schools.append([name, link])
         except:
             continue
 
-    driver.quit()
     return schools
 
 
-def scrape_staff(args):
-    school, site = args
-    driver = make_driver()
+# ---------------- Scrape Staff ----------------
+async def scrape_staff(browser, school, site, seen_urls):
+    page = await browser.new_page()
     staff_url = site.rstrip("/") + "/staff"
     data = []
 
     try:
-        driver.get(staff_url)
-        final_url = driver.current_url
+        await page.goto(staff_url, timeout=60000)
+        final_url = page.url
 
-        with url_lock:
-            if final_url in SCRAPED_STAFF_URLS:
-                driver.quit()
-                return []
-            SCRAPED_STAFF_URLS.add(final_url)
+        if final_url in seen_urls:
+            await page.close()
+            return []
 
-        WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "div.fsConstituentItem"))
-        )
+        seen_urls.add(final_url)
 
-        cards = driver.find_elements(By.CSS_SELECTOR, "div.fsConstituentItem")
+        await page.wait_for_selector("div.fsConstituentItem", timeout=15000)
+        cards = await page.query_selector_all("div.fsConstituentItem")
 
         for card in cards:
-            try:
-                name = card.find_element(By.CSS_SELECTOR, "h3.fsFullName").text.strip()
-            except:
-                name = ""
+            async def safe_text(sel):
+                el = await card.query_selector(sel)
+                return (await el.inner_text()).strip() if el else ""
 
-            try:
-                role = card.find_element(By.CSS_SELECTOR, "div.fsTitles").text.replace("Title:", "").strip()
-            except:
-                role = ""
-
-            try:
-                email = card.find_element(By.CSS_SELECTOR, "div.fsEmail a").text.strip()
-            except:
-                email = ""
+            name = await safe_text("h3.fsFullName")
+            role = (await safe_text("div.fsTitles")).replace("Title:", "").strip()
+            email = await safe_text("div.fsEmail a")
 
             data.append([name, role, email, school])
 
-    except:
+    except TimeoutError:
         pass
 
-    driver.quit()
+    await page.close()
     return data
 
 
-def main():
-    console.print("\n[bold green]Getting school list...[/bold green]")
-    schools = get_schools()
+# ---------------- Main ----------------
+async def main():
+    console.print("[bold green]Starting FAST async Playwright scraper...[/bold green]")
 
-    console.print(f"\nFound {len(schools)} schools\n")
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-gpu",
+                "--no-sandbox"
+            ]
+        )
 
-    for i, (name, url) in enumerate(schools, start=1):
-        console.print(f"{i}. {name} -> {url}")
+        page = await browser.new_page()
+        schools = await get_schools(page)
 
-    limit = int(input("\nHow many schools do you want to scrape? : "))
-    schools = schools[:limit]
+        console.print(f"\nFound {len(schools)} schools\n")
+        for i, (name, url) in enumerate(schools, start=1):
+            console.print(f"{i}. {name} -> {url}")
 
-    all_rows = []
-    MAX_WORKERS = 5
+        limit = int(input("\nHow many schools do you want to scrape? : "))
+        schools = schools[:limit]
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(scrape_staff, s) for s in schools]
+        seen_urls = set()
 
-        for future in as_completed(futures):
-            rows = future.result()
-            all_rows.extend(rows)
+        tasks = [
+            scrape_staff(browser, school, site, seen_urls)
+            for school, site in schools
+        ]
 
-    # Build table ONCE
+        results = await asyncio.gather(*tasks)
+        await browser.close()
+
+    # Flatten results
+    all_rows = [row for group in results for row in group]
+
     table = Table(title="Final Staff Data")
     table.add_column("Name", style="cyan")
     table.add_column("Role", style="yellow")
     table.add_column("Email", style="green")
     table.add_column("School", style="magenta")
 
-    for row in all_rows:
-        table.add_row(
-            row[0][:25],
-            row[1][:25],
-            row[2][:30],
-            row[3][:25]
-        )
+    for r in all_rows:
+        table.add_row(r[0][:25], r[1][:25], r[2][:30], r[3][:25])
 
     console.print(table)
 
     df = pd.DataFrame(all_rows, columns=["Name", "Role", "Email", "School"])
     df.drop_duplicates(subset=["Email"], inplace=True)
+    df.to_excel("fulton_staff_fast_async.xlsx", index=False)
 
-    df.to_excel("fulton_staff_fast.xlsx", index=False)
-    console.print("\n[bold green]Saved: fulton_staff_fast.xlsx[/bold green]")
+    console.print("\n[bold green]Saved: fulton_staff_fast_async.xlsx[/bold green]")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
+
 
